@@ -197,3 +197,27 @@ jobs:
 
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+      - name: Run the published image
+        run: docker run --rm "$IMAGE:latest" --version
+
+      - name: Check the tag is anonymously pullable
+        run: |
+          set -euo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          token=$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" | jq -r .token)
+
+          code=$(curl -s -o index.json -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            "https://ghcr.io/v2/${repo}/manifests/latest")
+
+          if [ "$code" != "200" ]; then
+            echo "ghcr.io/${repo}:latest is not anonymously pullable (HTTP $code)." >&2
+            echo "Make the package public: https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/chmlfrp/settings" >&2
+            exit 1
+          fi
+
+          jq -r '.manifests[].platform
+            | "\(.os)/\(.architecture)\(if .variant then "/" + .variant else "" end)"' \
+            index.json | sort
