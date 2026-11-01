@@ -1,0 +1,199 @@
+name: build
+
+on:
+  schedule:
+    # Daily check for a new upstream release.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/chmlfrp
+  DOWNLOAD_INFO: https://cf-v2.uapis.cn/download_info
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+      link: ${{ steps.info.outputs.link }}
+      matrix: ${{ steps.info.outputs.matrix }}
+      arches: ${{ steps.info.outputs.arches }}
+    steps:
+      - name: Read upstream download info
+        id: info
+        run: |
+          set -euo pipefail
+
+          got=0
+          for attempt in $(seq 1 6); do
+            if curl -fsSL --max-time 30 "$DOWNLOAD_INFO" -o info.json; then
+              got=1
+              break
+            fi
+            echo "download_info attempt $attempt failed" >&2
+            sleep 5
+          done
+          if [ "$got" -ne 1 ]; then
+            echo "could not fetch $DOWNLOAD_INFO" >&2
+            exit 1
+          fi
+
+          jq -e '.code == 200 and (.data.version | type == "string") and (.data.link | type == "string")' info.json >/dev/null
+
+          version=$(jq -r '.data.version' info.json)
+          link=$(jq -r '.data.link' info.json)
+
+          # Docker can only run linux binaries, and only these architecture names
+          # map onto a well-known OCI platform string.
+          matrix=$(jq -c '
+            {
+              "amd64": "linux/amd64",
+              "arm": "linux/arm/v7",
+              "arm64": "linux/arm64",
+              "mips": "linux/mips",
+              "mipsle": "linux/mipsle",
+              "mips64": "linux/mips64",
+              "mips64le": "linux/mips64le",
+              "riscv64": "linux/riscv64"
+            } as $platforms
+            | [ .data.system.linux[]
+                | .architecture as $arch
+                | select($platforms | has($arch))
+                | { route: .route, arch: $arch, platform: $platforms[$arch] } ]
+            | { include: . }
+          ' info.json)
+
+          count=$(jq '.include | length' <<<"$matrix")
+          if [ "$count" -eq 0 ]; then
+            echo "no usable linux target in upstream feed" >&2
+            cat info.json >&2
+            exit 1
+          fi
+
+          arches=$(jq -r '.include[].arch' <<<"$matrix" | tr '\n' ' ')
+
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "link=$link" >>"$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+          echo "arches=$arches" >>"$GITHUB_OUTPUT"
+
+          jq -r '.include[] | "  \(.arch)\t\(.platform)\t\(.route)"' <<<"$matrix"
+
+  build:
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.meta.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frpc for ${{ matrix.arch }}
+        env:
+          LINK: ${{ needs.meta.outputs.link }}
+          ROUTE: ${{ matrix.route }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="dist/$ROUTE"
+
+          for attempt in $(seq 1 6); do
+            # The CDN resets long transfers; resume instead of restarting.
+            if curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+                 -C - --max-time 900 "$LINK$ROUTE" -o "$archive" \
+               && tar -tzf "$archive" >/dev/null; then
+              break
+            fi
+            echo "download attempt $attempt failed" >&2
+            sleep 5
+          done
+
+          tar -xzf "$archive" -C dist
+          src=$(find dist -type f -name frpc -print -quit)
+          test -n "$src"
+          mv "$src" dist/frpc
+          chmod +x dist/frpc
+          ls -l dist/frpc
+
+      - name: Sanity check native binary
+        if: matrix.arch == 'amd64'
+        run: ./dist/frpc --version
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.platform }}
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          cp /etc/ssl/certs/ca-certificates.crt cacert.pem
+
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --provenance=false \
+            --sbom=false \
+            --build-arg FRPC_VERSION="$VERSION" \
+            --build-arg SOURCE="https://github.com/${GITHUB_REPOSITORY}" \
+            -t "$IMAGE:$ARCH" \
+            -t "$IMAGE:$VERSION-$ARCH" \
+            --push .
+
+  merge:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-arch manifests
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          ARCHES: ${{ needs.meta.outputs.arches }}
+        run: |
+          set -euo pipefail
+
+          tags=(-t "$IMAGE:$VERSION" -t "$IMAGE:latest")
+
+          # "0.70.1_261019" also gets a plain "0.70.1" tag.
+          semver="${VERSION%%_*}"
+          if [ "$semver" != "$VERSION" ]; then
+            tags+=(-t "$IMAGE:$semver")
+          fi
+
+          sources=()
+          for arch in $ARCHES; do
+            sources+=("$IMAGE:$arch")
+          done
+
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
