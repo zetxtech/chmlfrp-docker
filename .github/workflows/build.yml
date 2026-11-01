@@ -5,6 +5,11 @@ on:
     # Daily check for a new upstream release.
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only check for a new upstream version, do not build
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -89,7 +94,7 @@ jobs:
           # The daily run only exists to notice new upstream releases, so it
           # stops here when this version is already published.
           skip=false
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] || [ "${{ inputs.dry_run }}" = "true" ]; then
             repo="${IMAGE#ghcr.io/}"
             token=$(curl -fsSL --max-time 30 \
               "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" \

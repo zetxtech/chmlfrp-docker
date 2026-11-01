@@ -81,7 +81,7 @@ remotePort = 12345
 
 触发方式：每天 03:17（UTC）定时检查、手动 `workflow_dispatch`、以及修改 `Dockerfile` 或工作流本身时。
 
-定时任务只是用来发现新版本：目标版本标签已经存在就直接跳过，不重复构建；手动触发和 push 触发则总是重建。
+定时任务只是用来发现新版本：目标版本标签已经存在就直接跳过，不重复构建；手动触发和 push 触发则总是重建。手动触发时可以勾上 `dry_run`，只做版本检查不构建。
 
 构建完成后 `merge` 任务会做三项验证：匿名从 GHCR 拉取 manifest（确认公开可拉）、`docker run ... --version`（确认入口可用）、挂载一份 `frpc.toml` 启动并检查日志里的 `start frpc service for config file [/etc/frp/frpc.toml]`（确认默认参数和配置读取都正常）。
 
