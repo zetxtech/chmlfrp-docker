@@ -1,2 +1,4 @@
 dist/
 cacert.pem
+zoneinfo/
+smoke/

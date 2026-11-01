@@ -177,6 +177,13 @@ jobs:
           set -euo pipefail
           cp /etc/ssl/certs/ca-certificates.crt cacert.pem
 
+          # Go reads TZ from /usr/share/zoneinfo and the binary does not embed
+          # tzdata, so ship the zone files; right/ (leap seconds) is not needed.
+          rm -rf zoneinfo
+          cp -a /usr/share/zoneinfo zoneinfo
+          rm -rf zoneinfo/right zoneinfo/posix
+          du -sh zoneinfo
+
           docker buildx build \
             --platform "$PLATFORM" \
             --provenance=false \
@@ -254,6 +261,14 @@ jobs:
           cat smoke.log
 
           grep -q 'start frpc service for config file \[/etc/frp/frpc.toml\]' smoke.log
+
+          # The default TZ must actually be honoured: the first log timestamp
+          # has to read as Asia/Shanghai, not UTC.
+          logged=$(grep -m1 -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}' smoke.log || true)
+          expected=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H')
+          previous=$(TZ=Asia/Shanghai date -d '-1 hour' '+%Y-%m-%d %H')
+          echo "container log time: ${logged} (Asia/Shanghai now: ${expected})"
+          [ "$logged" = "$expected" ] || [ "$logged" = "$previous" ]
 
       - name: Check the tag is anonymously pullable
         run: |

@@ -67,9 +67,9 @@ remotePort = 12345
 | mips64 / mips64le | linux/mips64、linux/mips64le | |
 | riscv64 | linux/riscv64 | |
 
-镜像基于 `scratch`，只包含静态链接的 `frpc` 和 CA 证书，没有 shell、没有包管理器。需要进容器排查时用 `docker run --entrypoint` 指定别的二进制是行不通的——这是刻意的：给 mips/riscv64 这类没有基础镜像的平台提供统一构建方式，同时不需要 qemu。
+镜像基于 `scratch`，只包含静态链接的 `frpc`、CA 证书和时区数据，没有 shell、没有包管理器。这样 mips/riscv64 这类没有基础镜像的平台也能用同一套构建，且不需要 qemu。
 
-副作用：镜像内没有 tzdata，`TZ` 环境变量不生效，frpc 日志时间按 UTC 输出。
+时区默认 `TZ=Asia/Shanghai`（和 frpc 镜像一致），zoneinfo 放在 `/usr/share/zoneinfo`，要换时区直接 `-e TZ=Asia/Tokyo`。上游二进制没有内嵌 tzdata，构建时才把 zone 文件拷进镜像，所以日志时间不会是 UTC。
 
 ## 自动更新
 
@@ -83,6 +83,6 @@ remotePort = 12345
 
 定时任务只是用来发现新版本：目标版本标签已经存在就直接跳过，不重复构建；手动触发和 push 触发则总是重建。手动触发时可以勾上 `dry_run`，只做版本检查不构建。
 
-构建完成后 `merge` 任务会做三项验证：匿名从 GHCR 拉取 manifest（确认公开可拉）、`docker run ... --version`（确认入口可用）、挂载一份 `frpc.toml` 启动并检查日志里的 `start frpc service for config file [/etc/frp/frpc.toml]`（确认默认参数和配置读取都正常）。
+构建完成后 `merge` 任务会做三项验证：匿名从 GHCR 拉取 manifest（确认公开可拉）、`docker run ... --version`（确认入口可用）、挂载一份 `frpc.toml` 启动并检查日志里的 `start frpc service for config file [/etc/frp/frpc.toml]` 和日志时间是否等于 Asia/Shanghai 当前小时（确认默认参数、配置读取和时区都正常）。
 
 上游发布新版本后，定时任务会生成新版本号标签；`latest` 始终跟随上游最新版。
