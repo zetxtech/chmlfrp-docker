@@ -31,6 +31,7 @@ jobs:
       link: ${{ steps.info.outputs.link }}
       matrix: ${{ steps.info.outputs.matrix }}
       arches: ${{ steps.info.outputs.arches }}
+      skip: ${{ steps.info.outputs.skip }}
     steps:
       - name: Read upstream download info
         id: info
@@ -85,15 +86,35 @@ jobs:
 
           arches=$(jq -r '.include[].arch' <<<"$matrix" | tr '\n' ' ')
 
+          # The daily run only exists to notice new upstream releases, so it
+          # stops here when this version is already published.
+          skip=false
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            repo="${IMAGE#ghcr.io/}"
+            token=$(curl -fsSL --max-time 30 \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" \
+              | jq -r .token || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://ghcr.io/v2/${repo}/manifests/${version}")
+            if [ "$code" = "200" ]; then
+              skip=true
+              echo "ghcr.io/${repo}:${version} already exists, nothing to do"
+            fi
+          fi
+
           echo "version=$version" >>"$GITHUB_OUTPUT"
           echo "link=$link" >>"$GITHUB_OUTPUT"
           echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
           echo "arches=$arches" >>"$GITHUB_OUTPUT"
+          echo "skip=$skip" >>"$GITHUB_OUTPUT"
 
           jq -r '.include[] | "  \(.arch)\t\(.platform)\t\(.route)"' <<<"$matrix"
 
   build:
     needs: meta
+    if: needs.meta.outputs.skip != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -163,6 +184,7 @@ jobs:
 
   merge:
     needs: [meta, build]
+    if: needs.meta.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Set up buildx
@@ -200,6 +222,33 @@ jobs:
 
       - name: Run the published image
         run: docker run --rm "$IMAGE:latest" --version
+
+      - name: Run with a mounted config file
+        run: |
+          set -euo pipefail
+          mkdir -p smoke
+          cat > smoke/frpc.toml <<'EOF'
+          serverAddr = "127.0.0.1"
+          serverPort = 7000
+
+          [[proxies]]
+          name = "smoke"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 22
+          remotePort = 6000
+          EOF
+
+          docker run -d --name frpc-smoke \
+            -v "$PWD/smoke/frpc.toml:/etc/frp/frpc.toml:ro" \
+            "$IMAGE:latest"
+
+          sleep 10
+          docker logs frpc-smoke >smoke.log 2>&1 || true
+          docker rm -f frpc-smoke >/dev/null
+          cat smoke.log
+
+          grep -q 'start frpc service for config file \[/etc/frp/frpc.toml\]' smoke.log
 
       - name: Check the tag is anonymously pullable
         run: |
